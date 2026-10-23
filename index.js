@@ -218,6 +218,19 @@ if (!parentUid) {
     await checkProfile(parentUid, "Parent");
 
     codePath = `pairingCodes/${parentUid}`;
+    const codeRef = db.ref(codePath);
+
+const beforeTransaction = await codeRef.get();
+const beforeValue = beforeTransaction.val();
+
+console.log("Before transaction diagnostic", {
+  codePath,
+  exists: beforeTransaction.exists(),
+  parentUidMatches: beforeValue?.parentUid === parentUid,
+  hashMatches: beforeValue?.codeHash === submittedHash,
+  used: beforeValue?.used,
+  expiresAt: beforeValue?.expiresAt,
+});
     console.log("Pairing code path diagnostic", {
   codePath,
   parentUid,
@@ -283,7 +296,7 @@ if (!parentUid) {
     reservationCreated = true;
 
   // Consume the pairing code and diagnose the transaction input.
-const consumed = await db.ref(codePath).transaction((current) => {
+const consumed = await codeRef.transaction((current) => {
   const now = Date.now();
 
   if (!current) {
