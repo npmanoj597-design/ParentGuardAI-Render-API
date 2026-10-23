@@ -268,60 +268,67 @@ if (!parentUid) {
 
     reservationCreated = true;
 
-    // Consume the code atomically and log the reason if rejected.
+  // Consume the pairing code and diagnose the transaction input.
 const consumed = await db.ref(codePath).transaction((current) => {
+  const now = Date.now();
+
   if (!current) {
+    console.error("Transaction check failed: record missing");
     return;
   }
 
   if (current.parentUid !== parentUid) {
+    console.error("Transaction check failed: parent UID mismatch");
     return;
   }
 
   if (current.codeHash !== submittedHash) {
+    console.error("Transaction check failed: code hash mismatch");
     return;
   }
 
   if (current.used !== false) {
+    console.error("Transaction check failed: code already used", {
+      used: current.used,
+    });
     return;
   }
 
   if (
     typeof current.expiresAt !== "number" ||
-    current.expiresAt <= Date.now()
+    current.expiresAt <= now
   ) {
+    console.error("Transaction check failed: expired or invalid expiry", {
+      expiresAt: current.expiresAt,
+      now,
+    });
     return;
   }
+
+  console.log("Pairing code checks passed inside transaction", {
+    parentUid,
+    childUid,
+  });
 
   return {
     ...current,
     used: true,
     usedBy: childUid,
-    usedAt: Date.now(),
+    usedAt: now,
   };
 }, undefined, false);
 
 if (!consumed.committed) {
-  const latestSnapshot = await db.ref(codePath).get();
-  const latest = latestSnapshot.val();
-
-  console.error("Pairing code transaction rejected", {
+  console.error("Pairing code transaction not committed", {
     parentUid,
     childUid,
-    codeRecordExists: Boolean(latest),
-    parentUidMatches: latest?.parentUid === parentUid,
-    codeHashMatches: latest?.codeHash === submittedHash,
-    usedValue: latest?.used,
-    expiresAt: latest?.expiresAt,
-    now: Date.now(),
-    isExpired:
-      typeof latest?.expiresAt === "number" &&
-      latest.expiresAt <= Date.now(),
+    snapshotExists: consumed.snapshot.exists(),
+    snapshot: consumed.snapshot.val(),
   });
 
   throw makeError(
     400,
-    "The pairing code is invalid, expired, or already used. Generate a new code."
+    "The pairing code could not be consumed. Generate a new code and try again."
   );
 }
 
