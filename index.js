@@ -268,31 +268,55 @@ if (!parentUid) {
 
     reservationCreated = true;
 
-    // Consume the code atomically and recheck expiry and usage.
-    const consumed = await db.ref(codePath).transaction((current) => {
-      if (
-        !current ||
-        current.parentUid !== parentUid ||
-        current.codeHash !== submittedHash ||
-        current.used !== false ||
-        typeof current.expiresAt !== "number" ||
-        current.expiresAt <= Date.now()
-      ) {
-        return;
-      }
+    // Consume the code atomically and log the reason if rejected.
+const consumed = await db.ref(codePath).transaction((current) => {
+  if (!current) {
+    return;
+  }
 
-      return {
-        ...current,
-        used: true,
-        usedBy: childUid,
-        usedAt: Date.now(),
-      };
-    }, undefined, false);
+  if (current.parentUid !== parentUid) {
+    return;
+  }
 
-    if (!consumed.committed) {
+  if (current.codeHash !== submittedHash) {
+    return;
+  }
+
+  if (current.used !== false) {
+    return;
+  }
+
+  if (
+    typeof current.expiresAt !== "number" ||
+    current.expiresAt <= Date.now()
+  ) {
+    return;
+  }
+
+  return {
+    ...current,
+    used: true,
+    usedBy: childUid,
+    usedAt: Date.now(),
+  };
+}, undefined, false);
+
+if (!consumed.committed) {
+  const latestSnapshot = await db.ref(codePath).get();
+  const latest = latestSnapshot.val();
+
   console.error("Pairing code transaction rejected", {
     parentUid,
     childUid,
+    codeRecordExists: Boolean(latest),
+    parentUidMatches: latest?.parentUid === parentUid,
+    codeHashMatches: latest?.codeHash === submittedHash,
+    usedValue: latest?.used,
+    expiresAt: latest?.expiresAt,
+    now: Date.now(),
+    isExpired:
+      typeof latest?.expiresAt === "number" &&
+      latest.expiresAt <= Date.now(),
   });
 
   throw makeError(
@@ -301,7 +325,7 @@ if (!parentUid) {
   );
 }
 
-    codeConsumed = true;
+codeConsumed = true;
 
     // Verify this request still owns the reservation.
     const linkedAt = Date.now();
