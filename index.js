@@ -122,12 +122,20 @@ app.post("/createPairingCode", requireRole, async (req, res) => {
     const expiresAt = now + CODE_LIFETIME_MS;
 
     await db.ref(`pairingCodes/${req.uid}`).set({
+      
       parentUid: req.uid,
       codeHash: hashCode(code),
       createdAt: now,
       expiresAt,
       used: false,
     });
+    const verifyCode = await db.ref(`pairingCodes/${req.uid}`).get();
+
+console.log("Created code verification", {
+  path: `pairingCodes/${req.uid}`,
+  exists: verifyCode.exists(),
+  parentUidMatches: verifyCode.val()?.parentUid === req.uid,
+});
 
     console.log("Pairing code created", { parentUid: req.uid });
 
@@ -210,6 +218,12 @@ if (!parentUid) {
     await checkProfile(parentUid, "Parent");
 
     codePath = `pairingCodes/${parentUid}`;
+    console.log("Pairing code path diagnostic", {
+  codePath,
+  parentUid,
+  childUid,
+  databaseUrl: process.env.FIREBASE_DATABASE_URL,
+});
 
     // Reserve this child's parentOf record atomically.
     // Existing completed links are never overwritten.
