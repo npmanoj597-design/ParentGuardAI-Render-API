@@ -188,13 +188,17 @@ app.post("/redeemPairingCode", requireRole, async (req, res) => {
         break;
       }
     }
+if (!parentUid) {
+  console.error("Pairing lookup failed: no matching code hash", {
+    childUid,
+    numberOfCodeRecords: Object.keys(codes).length,
+  });
 
-    if (!parentUid) {
-      throw makeError(
-        400,
-        "Invalid or expired pairing code. Request a new code."
-      );
-    }
+  throw makeError(
+    400,
+    "Invalid or expired pairing code. Request a new code."
+  );
+}
 
     if (parentUid === childUid) {
       throw makeError(
@@ -286,11 +290,16 @@ app.post("/redeemPairingCode", requireRole, async (req, res) => {
     }, undefined, false);
 
     if (!consumed.committed) {
-      throw makeError(
-        400,
-        "The pairing code is invalid, expired, or already used. Generate a new code."
-      );
-    }
+  console.error("Pairing code transaction rejected", {
+    parentUid,
+    childUid,
+  });
+
+  throw makeError(
+    400,
+    "The pairing code is invalid, expired, or already used. Generate a new code."
+  );
+}
 
     codeConsumed = true;
 
