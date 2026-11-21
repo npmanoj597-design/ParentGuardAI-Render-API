@@ -274,6 +274,54 @@ app.post("/redeemPairingQR", requireRole, async (req, res) => {
   }
 });
 
+// Parent unlinks a paired child device.
+app.post("/unlinkChild", requireRole, async (req, res) => {
+  const parentUid = req.uid;
+
+  try {
+    if (req.role !== "Parent") {
+      throw makeError(403, "Only parents can unlink child accounts");
+    }
+
+    const childUid = String(req.body?.childUid ?? "").trim();
+    if (!childUid) {
+      throw makeError(400, "childUid is required");
+    }
+
+    // Verify parent-child relationship
+    const parentOfSnap = await db.ref(`parentOf/${childUid}`).get();
+    const parentOfData = parentOfSnap.val();
+
+    if (!parentOfData || parentOfData.parentUid !== parentUid) {
+      throw makeError(403, "This child account is not linked to your parent account");
+    }
+
+    // Atomically clear relationship across all tables
+    await Promise.all([
+      db.ref(`parentOf/${childUid}`).remove(),
+      db.ref(`parentChildren/${parentUid}/${childUid}`).remove(),
+      db.ref(`users/${childUid}/parentId`).remove(),
+      db.ref(`users/${childUid}/parentLinked`).set(false),
+      db.ref(`users/${parentUid}/children/${childUid}`).remove(),
+    ]);
+
+    console.log("Child unlinked successfully", { parentUid, childUid });
+
+    res.json({
+      success: true,
+      message: "Child device unlinked successfully",
+    });
+  } catch (error) {
+    console.error("Unlink child failed:", error.message);
+
+    if (!res.headersSent) {
+      res.status(error.status || 500).json({
+        error: error.status ? error.message : "Could not unlink child device",
+      });
+    }
+  }
+});
+
 app.use((err, req, res, next) => {
   console.error("Unhandled API error:", err.message);
 
