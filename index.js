@@ -10,7 +10,7 @@ const app = express();
 app.use(express.json({ limit: "10kb" }));
 
 const PORT = process.env.PORT || 10000;
-const QR_LIFETIME_MS = 2 * 60 * 1000;
+const QR_LIFETIME_MS = 15 * 60 * 1000; // 15 minutes expiration window
 
 const databaseUrl = process.env.FIREBASE_DATABASE_URL;
 const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
