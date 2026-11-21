@@ -47,6 +47,13 @@ function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+function normalizeRole(value) {
+  const s = String(value || "").trim().toLowerCase();
+  if (s === "parent") return "Parent";
+  if (s === "child") return "Child";
+  return null;
+}
+
 async function requireRole(req, res, next) {
   try {
     const header = req.headers.authorization || "";
@@ -59,21 +66,23 @@ async function requireRole(req, res, next) {
     const decoded = await auth.verifyIdToken(match[1]);
 
     req.uid = decoded.uid;
-    req.role = decoded.role;
+    req.role = normalizeRole(decoded.role);
 
-    if (req.role !== "Parent" && req.role !== "Child") {
+    if (!req.role) {
       // Fallback: If custom claim is not in the token, fetch role from Realtime Database profile
       const userSnap = await db.ref(`users/${req.uid}`).get();
       const profile = userSnap.val();
-      const dbRole = profile?.role;
-      if (dbRole === "Parent" || dbRole === "Child") {
+      const dbRole = normalizeRole(
+        profile?.role || profile?.userRole || profile?.accountType
+      );
+      if (dbRole) {
         req.role = dbRole;
         // Asynchronously set custom user claim so future ID tokens include it
         auth.setCustomUserClaims(req.uid, { role: dbRole }).catch(() => {});
       }
     }
 
-    if (req.role !== "Parent" && req.role !== "Child") {
+    if (!req.role) {
       throw makeError(403, "Your account does not have a valid role");
     }
 
@@ -88,8 +97,11 @@ async function requireRole(req, res, next) {
 async function checkProfile(uid, expectedRole) {
   const snapshot = await db.ref(`users/${uid}`).get();
   const profile = snapshot.val();
+  const role = normalizeRole(
+    profile?.role || profile?.userRole || profile?.accountType
+  );
 
-  if (!profile || profile.role !== expectedRole) {
+  if (!profile || role !== normalizeRole(expectedRole)) {
     throw makeError(
       403,
       `A valid ${expectedRole} profile is required`
@@ -155,11 +167,6 @@ app.post("/createPairingQR", requireRole, async (req, res) => {
 // Child submits the token scanned from the parent's QR code.
 app.post("/redeemPairingQR", requireRole, async (req, res) => {
   const childUid = req.uid;
-  let tokenRef = null;
-  let reservationRef = null;
-  let reservationId = null;
-  let reservationCreated = false;
-  let tokenConsumed = false;
 
   try {
     if (req.role !== "Child") {
@@ -175,19 +182,28 @@ app.post("/redeemPairingQR", requireRole, async (req, res) => {
     }
 
     const tokenHash = hashToken(token);
-    tokenRef = db.ref(`pairingQrTokens/${tokenHash}`);
+    const tokenRef = db.ref(`pairingQrTokens/${tokenHash}`);
 
     const tokenSnapshot = await tokenRef.get();
     const tokenRecord = tokenSnapshot.val();
 
+    if (!tokenRecord || typeof tokenRecord.parentUid !== "string") {
+      throw makeError(400, "QR code is invalid. Ask the parent to generate a new one.");
+    }
+
     if (
-      !tokenRecord ||
-      typeof tokenRecord.parentUid !== "string" ||
-      tokenRecord.used !== false ||
       typeof tokenRecord.expiresAt !== "number" ||
       tokenRecord.expiresAt <= Date.now()
     ) {
-      throw makeError(400, "QR code is invalid or expired. Ask the parent to generate a new one.");
+      throw makeError(400, "QR code has expired. Ask the parent to generate a new one.");
+    }
+
+    // Allow re-pairing or retrying by the same child account
+    const isAlreadyUsedByThisChild =
+      tokenRecord.used === true && tokenRecord.usedBy === childUid;
+
+    if (tokenRecord.used === true && !isAlreadyUsedByThisChild) {
+      throw makeError(400, "QR code has already been used. Ask the parent for a new QR code.");
     }
 
     const parentUid = tokenRecord.parentUid;
@@ -198,121 +214,44 @@ app.post("/redeemPairingQR", requireRole, async (req, res) => {
 
     await checkProfile(parentUid, "Parent");
 
-    reservationRef = db.ref(`parentOf/${childUid}`);
-    reservationId = crypto.randomUUID();
-
-    const now = Date.now();
-
-    // Acquire or reclaim pairing reservation
-    const reservation = await reservationRef.transaction((current) => {
-      // If no relationship exists yet, start pending reservation
-      if (current === null) {
-        return {
-          parentUid,
-          status: "pending",
-          reservedAt: now,
-          reservationId,
-        };
-      }
-
-      // If already linked to this exact parent, preserve it
-      if (current.linkedAt && current.status !== "pending") {
-        if (current.parentUid === parentUid) {
-          return current;
-        }
-        return; // Linked to another parent
-      }
-
-      // If in pending status, reclaim it if it is stale (> 3 seconds) or for this same parent
-      const pendingAge = now - Number(current.reservedAt || 0);
-      if (current.status === "pending" || pendingAge > 3000 || current.parentUid === parentUid) {
-        return {
-          parentUid,
-          status: "pending",
-          reservedAt: now,
-          reservationId,
-        };
-      }
-
-      return;
-    }, undefined, false);
-
-    if (!reservation.committed) {
-      const existing = reservation.snapshot.val();
-
-      if (existing && existing.linkedAt && existing.status !== "pending") {
-        if (existing.parentUid === parentUid) {
-          return res.json({
-            success: true,
-            message: "Parent and child linked successfully",
-            parentUid,
-          });
-        }
-        throw makeError(409, "This child device is already linked to another parent account.");
-      }
-
-      throw makeError(409, "A pairing attempt is currently in progress. Please wait 3 seconds and scan again.");
+    // Check if child is already linked to another parent
+    const parentOfSnap = await db.ref(`parentOf/${childUid}`).get();
+    const currentParent = parentOfSnap.val();
+    if (
+      currentParent &&
+      currentParent.parentUid &&
+      currentParent.parentUid !== parentUid &&
+      currentParent.status !== "pending"
+    ) {
+      throw makeError(409, "This child device is already linked to another parent account.");
     }
 
-    reservationCreated = true;
-
-    // Atomically consume the QR token so it cannot be reused.
-    const consumed = await tokenRef.transaction((current) => {
-      if (!current || current.parentUid !== parentUid) {
-        return;
-      }
-
-      // If already used by this child during this session, allow finishing
-      if (current.used === true && current.usedBy === childUid) {
-        return current;
-      }
-
-      if (
-        current.used !== false ||
-        typeof current.expiresAt !== "number" ||
-        current.expiresAt <= now
-      ) {
-        return;
-      }
-
-      return {
-        ...current,
-        used: true,
-        usedBy: childUid,
-        usedAt: now,
-      };
-    }, undefined, false);
-
-    if (!consumed.committed) {
-      // Release reservation if token failed
-      await reservationRef.remove().catch(() => {});
-      throw makeError(400, "QR code is invalid, expired, or already used. Ask the parent for a new QR code.");
-    }
-
-    tokenConsumed = true;
+    // Mark token as used immediately so it cannot be reused
+    await tokenRef.update({
+      used: true,
+      usedBy: childUid,
+      usedAt: Date.now(),
+    });
 
     const linkedAt = Date.now();
 
-    // Finalize relationship
-    await reservationRef.set({
-      parentUid,
-      linkedAt,
-    });
+    // Finalize relationship across all database tables
+    await Promise.all([
+      db.ref(`parentOf/${childUid}`).set({
+        parentUid,
+        linkedAt,
+      }),
+      db.ref(`parentChildren/${parentUid}/${childUid}`).set({
+        linkedAt,
+      }),
+      db.ref(`users/${childUid}/parentId`).set(parentUid),
+      db.ref(`users/${childUid}/parentLinked`).set(true),
+      db.ref(`users/${parentUid}/children/${childUid}`).set({
+        linkedAt,
+      }),
+    ]);
 
-    await db.ref(`parentChildren/${parentUid}/${childUid}`).set({
-      linkedAt,
-    });
-
-    // Also sync the relationship under /users for direct mobile UI updates
-    await db.ref(`users/${childUid}/parentId`).set(parentUid);
-    await db.ref(`users/${childUid}/parentLinked`).set(true);
-    await db.ref(`users/${parentUid}/children/${childUid}`).set({
-      linkedAt,
-    });
-
-    reservationCreated = false;
-
-    console.log("QR parent-child pairing completed", {
+    console.log("QR parent-child pairing completed successfully", {
       parentUid,
       childUid,
     });
@@ -324,31 +263,6 @@ app.post("/redeemPairingQR", requireRole, async (req, res) => {
     });
   } catch (error) {
     console.error("QR pairing failed:", error.message);
-
-    // Release only the pending reservation created by this request.
-    if (reservationCreated && reservationRef && reservationId) {
-      try {
-        await reservationRef.transaction((current) => {
-          if (
-            current &&
-            current.status === "pending" &&
-            current.reservationId === reservationId
-          ) {
-            return null;
-          }
-
-          return;
-        }, undefined, false);
-      } catch (rollbackError) {
-        console.error("Could not release QR pairing reservation");
-      }
-    }
-
-    if (tokenConsumed) {
-      console.error(
-        "QR token was consumed. Generate a fresh QR code before retrying."
-      );
-    }
 
     if (!res.headersSent) {
       res.status(error.status || 500).json({
