@@ -62,6 +62,18 @@ async function requireRole(req, res, next) {
     req.role = decoded.role;
 
     if (req.role !== "Parent" && req.role !== "Child") {
+      // Fallback: If custom claim is not in the token, fetch role from Realtime Database profile
+      const userSnap = await db.ref(`users/${req.uid}`).get();
+      const profile = userSnap.val();
+      const dbRole = profile?.role;
+      if (dbRole === "Parent" || dbRole === "Child") {
+        req.role = dbRole;
+        // Asynchronously set custom user claim so future ID tokens include it
+        auth.setCustomUserClaims(req.uid, { role: dbRole }).catch(() => {});
+      }
+    }
+
+    if (req.role !== "Parent" && req.role !== "Child") {
       throw makeError(403, "Your account does not have a valid role");
     }
 
@@ -266,6 +278,13 @@ app.post("/redeemPairingQR", requireRole, async (req, res) => {
     }
 
     await db.ref(`parentChildren/${parentUid}/${childUid}`).set({
+      linkedAt,
+    });
+
+    // Also sync the relationship under /users for direct mobile UI updates
+    await db.ref(`users/${childUid}/parentId`).set(parentUid);
+    await db.ref(`users/${childUid}/parentLinked`).set(true);
+    await db.ref(`users/${parentUid}/children/${childUid}`).set({
       linkedAt,
     });
 
