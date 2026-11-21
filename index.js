@@ -201,42 +201,76 @@ app.post("/redeemPairingQR", requireRole, async (req, res) => {
     reservationRef = db.ref(`parentOf/${childUid}`);
     reservationId = crypto.randomUUID();
 
-    const reservationTime = Date.now();
+    const now = Date.now();
 
+    // Acquire or reclaim pairing reservation
     const reservation = await reservationRef.transaction((current) => {
+      // If no relationship exists yet, start pending reservation
       if (current === null) {
         return {
           parentUid,
           status: "pending",
-          reservedAt: reservationTime,
+          reservedAt: now,
           reservationId,
         };
       }
 
-      // Never overwrite an existing completed relationship.
+      // If already linked to this exact parent, preserve it
+      if (current.linkedAt && current.status !== "pending") {
+        if (current.parentUid === parentUid) {
+          return current;
+        }
+        return; // Linked to another parent
+      }
+
+      // If in pending status, reclaim it if it is stale (> 3 seconds) or for this same parent
+      const pendingAge = now - Number(current.reservedAt || 0);
+      if (current.status === "pending" || pendingAge > 3000 || current.parentUid === parentUid) {
+        return {
+          parentUid,
+          status: "pending",
+          reservedAt: now,
+          reservationId,
+        };
+      }
+
       return;
     }, undefined, false);
 
     if (!reservation.committed) {
       const existing = reservation.snapshot.val();
 
-      if (existing && existing.status === "pending") {
-        throw makeError(409, "A pairing attempt is already in progress");
+      if (existing && existing.linkedAt && existing.status !== "pending") {
+        if (existing.parentUid === parentUid) {
+          return res.json({
+            success: true,
+            message: "Parent and child linked successfully",
+            parentUid,
+          });
+        }
+        throw makeError(409, "This child device is already linked to another parent account.");
       }
 
-      throw makeError(409, "This child is already linked to a parent");
+      throw makeError(409, "A pairing attempt is currently in progress. Please wait 3 seconds and scan again.");
     }
 
     reservationCreated = true;
 
     // Atomically consume the QR token so it cannot be reused.
     const consumed = await tokenRef.transaction((current) => {
+      if (!current || current.parentUid !== parentUid) {
+        return;
+      }
+
+      // If already used by this child during this session, allow finishing
+      if (current.used === true && current.usedBy === childUid) {
+        return current;
+      }
+
       if (
-        !current ||
-        current.parentUid !== parentUid ||
         current.used !== false ||
         typeof current.expiresAt !== "number" ||
-        current.expiresAt <= Date.now()
+        current.expiresAt <= now
       ) {
         return;
       }
@@ -245,11 +279,13 @@ app.post("/redeemPairingQR", requireRole, async (req, res) => {
         ...current,
         used: true,
         usedBy: childUid,
-        usedAt: Date.now(),
+        usedAt: now,
       };
     }, undefined, false);
 
     if (!consumed.committed) {
+      // Release reservation if token failed
+      await reservationRef.remove().catch(() => {});
       throw makeError(400, "QR code is invalid, expired, or already used. Ask the parent for a new QR code.");
     }
 
@@ -257,25 +293,11 @@ app.post("/redeemPairingQR", requireRole, async (req, res) => {
 
     const linkedAt = Date.now();
 
-    // Finalize only the reservation created by this request.
-    const finalized = await reservationRef.transaction((current) => {
-      if (
-        !current ||
-        current.status !== "pending" ||
-        current.reservationId !== reservationId
-      ) {
-        return;
-      }
-
-      return {
-        parentUid,
-        linkedAt,
-      };
-    }, undefined, false);
-
-    if (!finalized.committed) {
-      throw makeError(409, "Pairing could not be finalized. Generate a new QR code.");
-    }
+    // Finalize relationship
+    await reservationRef.set({
+      parentUid,
+      linkedAt,
+    });
 
     await db.ref(`parentChildren/${parentUid}/${childUid}`).set({
       linkedAt,
